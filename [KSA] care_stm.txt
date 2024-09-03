@@ -1,0 +1,159 @@
+### R 4.1.3 버전 사용
+
+library(dplyr)
+library(stringr)
+library(stringi)
+library(stm)
+library(ggplot2)
+library(tidystm)
+
+## 언론사 정치성향, 시간변수를 포함한 메타데이터 만들기
+
+data_kor <- readxl::read_excel("care_20130101-20230731.xlsx")
+
+#메타데이터 생성 
+data_kor <- data_kor %>% 
+  mutate(
+    leftpress <- ifelse(media == "경향신문" | media == "한겨레", "lib", "con")
+  ) %>% 
+  mutate(date=parse_date_time(date, c("%Y%m%d"))) %>%      # 날짜 형식으로
+  mutate(year=year(date), quarter=quarter(date), month=month(date))   # 년, 분기, 월 변수 만들기
+
+## 분석 시작하기 
+
+read.csv("240218_care_meta.csv")
+
+## 텍스트 전처리용 함수 설정
+
+kor_pre <- function(text, spliter){
+  word <- (text %>% str_split(pattern = spliter))[[1]]
+  post_text <- word %>% 
+    str_remove_all('[[:punct:]]+|~') %>% #특수문자 제거
+    str_remove_all('[0-9]+[가-힣%]+|[0-9]') %>% #숫자 제거
+    str_remove_all('들$') #복수형 단수로
+  post_text <- post_text[nchar(post_text) > 1] #1글자 이상 단어만
+  post_text <- post_text %>% paste0(collapse = ' ') #단일 string으로 이어붙이기
+  return(post_text) #전처리된 결과
+}
+
+## 함수 적용 
+for(i in 1:nrow(data_care)){
+  data_care$text[i] <- kor_pre(data_care$keyword[i], ',')
+}
+
+# STM 사전처리
+mypreprocess <- textProcessor(data_care$text,
+                              metadata=data_care,
+                              lowercase=F,
+                              removestopwords=F,
+                              removenumbers=F,
+                              removepunctuation=F,
+                              stem=F,
+                              wordLengths = c(1,Inf))
+mypreprocess$documents[1]
+
+care_out <- prepDocuments(mypreprocess$documents, 
+                          mypreprocess$vocab, 
+                          mypreprocess$meta,
+                          lower.thresh=10)
+
+
+#searchK() 함수 활용하여 토픽 갯수 찾기
+set.seed(20240722)
+care_result <- stm::searchK(care_out$documents, care_out$vocab, 
+                        K=seq(5,20,1),
+                        prevalence = ~ s(year) + pol,
+                        data=care_out$meta,
+                        cores = 1, # windows
+                        gamma.prior='L1')
+ 
+plot(care_result) # searchK 결과 확인
+
+
+# STM 생성
+care_stm <- stm(care_out$documents, care_out$vocab, K=11, 
+                 prevalence =~ s(year) + pol,
+                 data=care_out$meta,
+                 seed=20240722, init.type="Spectral",
+                 gamma.prior='L1')
+
+
+# 각 토픽별 단어 확인하기 
+labelTopics(care_stm,topics=1:11,n=10)
+labelTopics(care_stm,topics=1:11,n=20)$frex %>% t()
+
+
+# 토픽별 대표문서 확인하기
+findThoughts(care_stm, 
+             texts = care_out$meta$title,   #대상 문서/title, text 등 변경하여 확인 가능
+             n = 30, # 출력 문서수(상위 n개)
+             topics = 7 ) # 자세히 보고싶은 토픽 설정
+
+
+# 토픽 명명하여 라벨링하기(순서대로)
+t_label <- c('지역사회 주거개선', '선거공약', '의료서비스', '학대사건', '코로나19', '재정 지원정책', '교육', '여성의 돌봄부담', '노인 및 장애인 복지서비스', '여성 관련 문학', '디지털 기술')
+
+
+# 토픽발현 top topics 확인하기
+plot(care_stm, type="summary", labeltype="prob", n=5, xlim=c(0, 0.45))
+
+
+# 변수 effect 확인하기 
+care_stm_result <- estimateEffect(c(1:11) ~ s(year) + pol,
+                                  nsims = 100, 
+                                  care_stm2, 
+                                  care_out$meta)
+
+# 언론사 성향별 토픽 비율의 차이 계산
+STM_estimate <- extract.estimateEffect(care_stm_result,
+                                       covariate = "pol",
+                                       method = "difference",
+                                       cov.value1 = 'lib',
+                                       cov.value2 = 'con',
+                                       model = care_stm)
+STM_estimate$label <- t_label
+
+## 언론사 성향별 토픽 비율 차이 시각화
+STM_estimate <- STM_estimate %>%
+  mutate(color = ifelse(ci.lower > 0, '진보언론',
+                        ifelse(ci.upper < 0, '보수언론', '차이없음')))
+
+STM_estimate %>% 
+  ggplot(aes(x=reorder(topic, -estimate), y=estimate, color = color))+
+  geom_point(size=3)+
+  geom_errorbar(aes(ymin=ci.lower, ymax=ci.upper),width=0.2)+
+  theme_bw(base_family = 'Nanum Gothic') +
+  geom_hline(yintercept = 0, color = 'red', linetype = 'dotted') +
+  ylab('Libreal to Conservative') +
+  theme(axis.title.x = element_blank()) + # x축 제목 제거
+  theme(axis.title.y = element_blank()) + # y축 제목 제거
+  coord_flip()
+
+## 시간 변수 effect 확인
+care_estimate2 <- extract.estimateEffect(care_stm_result,
+                                        covariate = "year",
+                                        method = "pointestimate",
+                                        model = care_stm)
+
+## 시간 변수 effect 시각화 
+ggplot(care_estimate2, aes(x = as.numeric(covariate.value), y = estimate, group = factor(topic), color = factor(topic))) + 
+  geom_line(size = 1) + 
+  geom_point(size = 1.3) + 
+  geom_errorbar(aes(ymin = ci.lower, ymax = ci.upper), width = 0.2, size = 0.5) + # 신뢰구간 추가
+  labs(title = "연도별 토픽 효과 추정치(주제)", x = "Year", y = "Estimate", color = "Topic") + 
+  theme_minimal() + 
+  facet_wrap(~ topic, ncol = 3)
+
+ 
+##### 참고 #####
+
+# 상호작용 모델
+care_stm_result_interaction <- estimateEffect(c(1:11) ~ pol * year, stmobj = care_stm, metadata = care_out$meta, nsims = 100)
+
+# 결과 확인하기 
+summary(care_stm_result_interaction)
+
+# 상호작용 효과 시각화 (정치성향: 진보)
+plot(care_stm_result_interaction, covariate = "year", model = care_stm, 
+     method = "continuous", moderator = "pol", moderator.value = "lib",
+     xlab = "Year", ylab = "Expected Topic Proportion")
